@@ -2,11 +2,17 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote
 
+import feedparser
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+
+JST = timezone(timedelta(hours=9))
 
 st.set_page_config(
     page_title="日本株スクリーナー",
@@ -46,6 +52,15 @@ TOPIX_CORE30: dict[str, str] = {
     "8411.T": "みずほフィナンシャルグループ",
     "6367.T": "ダイキン工業",
     "9434.T": "ソフトバンク",
+}
+
+# 株価に影響を与えそうなニュースカテゴリと検索キーワード
+NEWS_TOPICS: dict[str, list[str]] = {
+    "日本株市場": ["日経平均", "TOPIX", "東京株式市場"],
+    "米国市場": ["NYダウ", "S&P500", "FRB", "米利上げ"],
+    "為替": ["ドル円", "ユーロ円", "為替相場", "日銀"],
+    "商品市況": ["原油価格", "WTI", "金価格"],
+    "地政学・世界経済": ["中国経済", "中東情勢", "ウクライナ"],
 }
 
 
@@ -96,6 +111,53 @@ def fetch_universe(tickers: tuple[str, ...]) -> pd.DataFrame:
             if r is not None:
                 rows.append(r)
     return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_google_news(query: str, max_items: int = 10) -> list[dict]:
+    # Google ニュース RSS は認証不要・無料。15分キャッシュ。
+    url = (
+        f"https://news.google.com/rss/search?q={quote(query)}"
+        "&hl=ja&gl=JP&ceid=JP:ja"
+    )
+    try:
+        feed = feedparser.parse(url)
+    except Exception:
+        return []
+    items: list[dict] = []
+    for entry in feed.entries[:max_items]:
+        title_full = entry.get("title", "")
+        # Google News のタイトルは "見出し - 出典" 形式
+        if " - " in title_full:
+            title, source = title_full.rsplit(" - ", 1)
+        else:
+            title, source = title_full, ""
+        published_str = ""
+        published = entry.get("published") or ""
+        if published:
+            try:
+                dt = parsedate_to_datetime(published).astimezone(JST)
+                published_str = dt.strftime("%m/%d %H:%M")
+            except Exception:
+                published_str = published
+        items.append({
+            "title": title,
+            "link": entry.get("link", ""),
+            "source": source,
+            "published": published_str,
+        })
+    return items
+
+
+def render_news_items(items: list[dict]) -> None:
+    if not items:
+        st.info("ニュースが見つかりませんでした")
+        return
+    for item in items:
+        st.markdown(f"**[{item['title']}]({item['link']})**")
+        meta_parts = [p for p in (item.get("source"), item.get("published")) if p]
+        if meta_parts:
+            st.caption(" · ".join(meta_parts))
 
 
 def calculate_value_score(df: pd.DataFrame) -> pd.Series:
@@ -276,9 +338,47 @@ def page_detail() -> None:
     except Exception as e:
         st.error(f"チャート取得エラー: {e}")
 
+    st.subheader("関連ニュース")
+    # 日本語の銘柄名で検索(TOPIX Core 30 の日本語名を優先)
+    search_name = TOPIX_CORE30.get(ticker, info["銘柄名"])
+    news_items = fetch_google_news(search_name, max_items=8)
+    render_news_items(news_items)
 
-page = st.sidebar.radio("メニュー", ["スクリーニング", "個別銘柄詳細"])
+
+def page_news() -> None:
+    st.title("📰 市場ニュース")
+    st.caption("Google ニュースから株価に影響を与えそうな記事を取得します(15分キャッシュ)")
+
+    with st.sidebar:
+        st.header("ニュース設定")
+        selected = st.multiselect(
+            "表示カテゴリ",
+            list(NEWS_TOPICS.keys()),
+            default=list(NEWS_TOPICS.keys()),
+        )
+        max_per_category = st.slider("カテゴリあたりの件数", 3, 15, 5)
+        if st.button("🔄 再取得"):
+            fetch_google_news.clear()
+            st.rerun()
+
+    if not selected:
+        st.info("サイドバーでカテゴリを選択してください")
+        return
+
+    for category in selected:
+        st.subheader(category)
+        query = " OR ".join(NEWS_TOPICS[category])
+        items = fetch_google_news(query, max_items=max_per_category)
+        render_news_items(items)
+        st.divider()
+
+
+page = st.sidebar.radio(
+    "メニュー", ["スクリーニング", "個別銘柄詳細", "市場ニュース"]
+)
 if page == "スクリーニング":
     page_screening()
-else:
+elif page == "個別銘柄詳細":
     page_detail()
+else:
+    page_news()
