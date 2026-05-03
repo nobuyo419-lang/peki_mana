@@ -1,0 +1,6 @@
+moviepy==1.0.3
+imageio>=2.31
+imageio-ffmpeg>=0.4.9
+# moviepy 1.0.3 は Pillow 10 で削除された Image.ANTIALIAS を参照するため 9 系に固定
+Pillow>=9.5,<10
+numpy>=1.24,<2
