@@ -1,6 +1,7 @@
 // AudioManager.swift — AVAudioEngineで合成効果音(アセット不要)
 import Foundation
 import AVFoundation
+import Combine
 
 @MainActor
 final class AudioManager: ObservableObject {
