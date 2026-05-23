@@ -12,6 +12,16 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
+
+try:
+    import tweepy
+except ImportError:
+    tweepy = None
+
 JST = timezone(timedelta(hours=9))
 
 st.set_page_config(
@@ -373,12 +383,227 @@ def page_news() -> None:
         st.divider()
 
 
+def _get_secret(key: str, default: str = "") -> str:
+    try:
+        return st.secrets.get(key, default)
+    except (FileNotFoundError, KeyError):
+        return default
+
+
+def generate_tweet(api_key: str, ranking: list[dict], extra_note: str = "") -> str:
+    """Claude API で X 投稿文を日本語生成する(280字以内)。"""
+    if anthropic is None:
+        raise RuntimeError("anthropic パッケージが未インストールです (pip install anthropic)")
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    lines = []
+    for i, r in enumerate(ranking, 1):
+        per = f"{r['PER']:.1f}" if r.get("PER") is not None else "—"
+        pbr = f"{r['PBR']:.2f}" if r.get("PBR") is not None else "—"
+        div = f"{r['配当利回り(%)']:.2f}%" if r.get("配当利回り(%)") is not None else "—"
+        roe = f"{r['ROE(%)']:.1f}%" if r.get("ROE(%)") is not None else "—"
+        lines.append(
+            f"{i}. {r['銘柄名']}({r['コード']}) "
+            f"PER {per} / PBR {pbr} / 配当 {div} / ROE {roe} / 割安スコア {r['割安スコア']:.1f}"
+        )
+    data_block = "\n".join(lines)
+
+    system = (
+        "あなたは日本株の情報を発信する X(旧Twitter) のアカウント運営者です。"
+        "PER・PBR・配当利回り・ROE などの一般的な財務指標から算出した「割安スコア」上位銘柄を、"
+        "事実に基づき簡潔に紹介する日本語ツイートを作成します。"
+        "・全角換算で 140 文字以内(URL や絵文字含めても 280 半角文字以内)に厳守。"
+        "・投資助言ではない旨や免責のニュアンスを軽く添える。"
+        "・誇張・断定的な推奨表現は避ける。"
+        "・関連ハッシュタグ(#日本株 #投資 など)を最後に 2〜3 個。"
+        "・出力はツイート本文のみ、前置きや囲み記号は不要。"
+    )
+    user_msg = (
+        f"以下のスクリーニング結果(割安スコア上位 {len(ranking)} 銘柄)を題材に、"
+        "X 投稿文を 1 件作成してください。\n\n"
+        f"{data_block}"
+    )
+    if extra_note.strip():
+        user_msg += f"\n\n補足: {extra_note.strip()}"
+
+    response = client.messages.create(
+        model="claude-opus-4-7",
+        max_tokens=1024,
+        system=system,
+        messages=[{"role": "user", "content": user_msg}],
+    )
+    text_parts = [b.text for b in response.content if b.type == "text"]
+    return "".join(text_parts).strip()
+
+
+def post_to_x(
+    text: str,
+    consumer_key: str,
+    consumer_secret: str,
+    access_token: str,
+    access_token_secret: str,
+) -> dict:
+    """X API v2 で投稿。tweepy.Client を OAuth1 User Context で初期化。"""
+    if tweepy is None:
+        raise RuntimeError("tweepy パッケージが未インストールです (pip install tweepy)")
+
+    client = tweepy.Client(
+        consumer_key=consumer_key,
+        consumer_secret=consumer_secret,
+        access_token=access_token,
+        access_token_secret=access_token_secret,
+    )
+    resp = client.create_tweet(text=text)
+    return {"id": resp.data.get("id"), "text": resp.data.get("text")}
+
+
+def page_x_post() -> None:
+    st.title("🐦 Claude による X 自動投稿")
+    st.caption(
+        "TOPIX Core 30 のスクリーニング結果から割安スコア上位を抽出し、"
+        "Claude(claude-opus-4-7)が X 投稿文を生成 → X API で送信します。"
+    )
+
+    with st.expander("⚠️ 注意事項", expanded=False):
+        st.warning(
+            "・本機能は情報提供を目的とし、投資助言ではありません。\n"
+            "・X API の利用には開発者アカウントとアプリの権限(Read and Write)が必要です。\n"
+            "・API キーは画面入力か `.streamlit/secrets.toml` から読み込まれます。"
+            "公開リポジトリには絶対にコミットしないでください。"
+        )
+
+    with st.sidebar:
+        st.header("X 自動投稿設定")
+        top_n = st.slider("対象トップN(割安スコア順)", 3, 10, 5)
+        per_max = st.slider("PER 上限", 0, 50, 25, key="x_per")
+        pbr_max = st.slider("PBR 上限", 0.0, 5.0, 3.0, 0.1, key="x_pbr")
+
+        st.subheader("API キー")
+        anth_key = st.text_input(
+            "Anthropic API Key",
+            value=_get_secret("ANTHROPIC_API_KEY"),
+            type="password",
+        )
+        st.markdown("**X (Twitter) API**")
+        x_ck = st.text_input(
+            "Consumer Key", value=_get_secret("X_CONSUMER_KEY"), type="password"
+        )
+        x_cs = st.text_input(
+            "Consumer Secret", value=_get_secret("X_CONSUMER_SECRET"), type="password"
+        )
+        x_at = st.text_input(
+            "Access Token", value=_get_secret("X_ACCESS_TOKEN"), type="password"
+        )
+        x_ats = st.text_input(
+            "Access Token Secret",
+            value=_get_secret("X_ACCESS_TOKEN_SECRET"),
+            type="password",
+        )
+
+    if anthropic is None or tweepy is None:
+        st.error(
+            "必要なパッケージがインストールされていません。\n"
+            "`pip install anthropic tweepy` を実行してください。"
+        )
+        return
+
+    with st.spinner(f"{len(TOPIX_CORE30)}銘柄のデータを取得中…"):
+        df = fetch_universe(tuple(sorted(TOPIX_CORE30.keys())))
+
+    if df.empty:
+        st.error("株価データを取得できませんでした")
+        return
+
+    df["割安スコア"] = calculate_value_score(df)
+    filtered = df[
+        (df["PER"].fillna(999) <= per_max) & (df["PBR"].fillna(999) <= pbr_max)
+    ].copy()
+    ranked = filtered.sort_values("割安スコア", ascending=False).head(top_n)
+
+    st.subheader(f"投稿対象: 割安スコア上位 {len(ranked)} 銘柄")
+    st.dataframe(
+        ranked[
+            ["コード", "銘柄名", "業種", "株価", "PER", "PBR", "配当利回り(%)", "ROE(%)", "割安スコア"]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    if ranked.empty:
+        st.info("条件を満たす銘柄がありません。サイドバーの上限値を緩めてください。")
+        return
+
+    extra_note = st.text_input(
+        "投稿の追加トーン指示(任意)",
+        placeholder="例: 初心者向けにフレンドリーに、絵文字は控えめに",
+    )
+
+    if "x_draft" not in st.session_state:
+        st.session_state.x_draft = ""
+
+    col_gen, col_clear = st.columns([1, 1])
+    with col_gen:
+        if st.button("✍️ Claude で投稿文を生成", type="primary", use_container_width=True):
+            if not anth_key:
+                st.error("Anthropic API Key が未入力です")
+            else:
+                try:
+                    with st.spinner("Claude が投稿文を生成中…"):
+                        st.session_state.x_draft = generate_tweet(
+                            anth_key, ranked.to_dict("records"), extra_note
+                        )
+                except Exception as e:
+                    st.error(f"生成に失敗しました: {e}")
+    with col_clear:
+        if st.button("🗑 下書きをクリア", use_container_width=True):
+            st.session_state.x_draft = ""
+
+    draft = st.text_area(
+        "投稿プレビュー(編集可)",
+        value=st.session_state.x_draft,
+        height=180,
+        key="x_draft_edit",
+    )
+    char_count = len(draft)
+    color = "red" if char_count > 280 else "gray"
+    st.markdown(
+        f"<span style='color:{color}'>文字数: {char_count} / 280</span>",
+        unsafe_allow_html=True,
+    )
+
+    if st.button("🚀 X に投稿する", disabled=not draft or char_count > 280):
+        missing = [
+            name
+            for name, val in [
+                ("Anthropic Key", anth_key),
+                ("X Consumer Key", x_ck),
+                ("X Consumer Secret", x_cs),
+                ("X Access Token", x_at),
+                ("X Access Token Secret", x_ats),
+            ]
+            if not val
+        ]
+        if missing:
+            st.error(f"以下が未入力です: {', '.join(missing)}")
+        else:
+            try:
+                with st.spinner("X に投稿中…"):
+                    result = post_to_x(draft, x_ck, x_cs, x_at, x_ats)
+                st.success(f"投稿しました(tweet id: {result['id']})")
+                st.session_state.x_draft = ""
+            except Exception as e:
+                st.error(f"投稿に失敗しました: {e}")
+
+
 page = st.sidebar.radio(
-    "メニュー", ["スクリーニング", "個別銘柄詳細", "市場ニュース"]
+    "メニュー", ["スクリーニング", "個別銘柄詳細", "市場ニュース", "X 自動投稿"]
 )
 if page == "スクリーニング":
     page_screening()
 elif page == "個別銘柄詳細":
     page_detail()
-else:
+elif page == "市場ニュース":
     page_news()
+else:
+    page_x_post()
